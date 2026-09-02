@@ -6947,23 +6947,17 @@ function _setMessageScrollToBottom(){
   const el=$('messages');
   if(!el) return;
   _programmaticScroll=true;_programmaticScrollSetAt=performance.now();
-  el.scrollTop=el.scrollHeight;
-  _lastScrollTop=el.scrollTop;_lastMessageClientHeight=el.clientHeight;
+  el.scrollTop=1e9;
+  _lastScrollTop=el.scrollTop;
   _nearBottomCount=2;
   _scrollPinned=true;
   requestAnimationFrame(()=>{
-    // Retry the bottom write on the next layout frame so a DOM rebuild that
-    // grows the transcript after the first write doesn't strand a pinned
-    // conversation mid-scroll (#3319). But by this frame the user may have
-    // scrolled up — under the sticky-unpin model (#3343) _messageUserUnpinned
-    // is the authoritative "user scrolled away" signal, so DON'T snap them back
-    // or re-pin if so; only release the programmatic-scroll latch.
     if(_messageUserUnpinned || !_scrollPinned || _recentNonMessageScrollIntent()){
       _deferClearProgrammaticScroll();
       return;
     }
-    el.scrollTop=el.scrollHeight;
-    _lastScrollTop=el.scrollTop;_lastMessageClientHeight=el.clientHeight;
+    el.scrollTop=1e9;
+    _lastScrollTop=el.scrollTop;
     _nearBottomCount=2;
     _scrollPinned=true;
     _deferClearProgrammaticScroll();
@@ -6992,11 +6986,8 @@ function _repinMessagesAfterComposerResize(){
   if(_messageUserUnpinned || !_scrollPinned) return;
   const el=$('messages');
   if(!el) return;
-  // Already at/very near the bottom? nothing to do (avoids needless writes while
-  // idle-reading a short conversation that isn't scrollable).
-  if(_messageBottomDistance()<=1) return;
   if(typeof _setMessageScrollToBottom==='function') _setMessageScrollToBottom();
-  else { el.scrollTop=el.scrollHeight; }
+  else { el.scrollTop=1e9; }
 }
 if(typeof window!=='undefined') window._repinMessagesAfterComposerResize=_repinMessagesAfterComposerResize;
 function _shouldFollowMessagesOnDomReplace(){
@@ -7107,8 +7098,8 @@ function _settleFinalScroll(token){
     return;
   }
   _programmaticScroll=true;_programmaticScrollSetAt=performance.now();
-  el.scrollTop=el.scrollHeight;
-  _lastScrollTop=el.scrollTop;_lastMessageClientHeight=el.clientHeight;
+  el.scrollTop=1e9;
+  _lastScrollTop=el.scrollTop;
   _nearBottomCount=2;
   _scrollPinned=true;
   _deferClearProgrammaticScroll();
@@ -7120,28 +7111,19 @@ function scrollIfPinned(){
   // reclaim the bottom while it is active (#6621). _finishMessageJumpScroll()
   // reconciles the pin state once the jump settles.
   if(typeof _messageJumpScrollOwner!=='undefined'&&_messageJumpScrollOwner) return;
-  if(_messageUserUnpinned){
-    // Only scrollToBottom() cleared this flag, so one scroll-up permanently
-    // killed auto-follow. Re-pin ONLY when the reader has genuinely returned to
-    // the true bottom tail (<=80px), NOT on mere near-bottom proximity — the
-    // #4295 invariant is that proximity alone (inside the ~250px band) must not
-    // re-pin, or a reader scanning the last few lines gets yanked to the bottom
-    // mid-stream. Also bail on ANY recent message-pane scroll intent (wheel,
-    // key, touch) and non-message intent, so an active scroll-up near the tail
-    // is never overridden. Uses the same _nearBottomCount debounce as the
-    // scroll listener (~4859-4866).
-    if(_recentNonMessageScrollIntent()||_recentMessageScrollIntent()||_recentMessageTouchScrollIntent()||_recentMessageWheelIntent()||_recentMessageKeyScrollIntent()){ _nearBottomCount=0; return; }
-    if(_messageBottomDistance()>80){ _nearBottomCount=0; return; }
-    _nearBottomCount=_nearBottomCount+1;
-    if(_nearBottomCount<2) return;
-    _nearBottomCount=0;
-    _messageUserUnpinned=false;
-    _scrollPinned=true;
-  }
-  if(!_scrollPinned) return;
+  // If the user manually scrolled away, do not force them down.
+  // The scroll event listener on #messages re-pins when user reaches bottom.
+  if(_messageUserUnpinned || !_scrollPinned) return;
   if(_recentNonMessageScrollIntent()) return;
-  if(_messageBottomDistance()>500) _setMessageScrollToBottom();
-  _settleMessageScrollToBottom(false);
+
+  const el=document.getElementById('messages');
+  if(!el) return;
+  _programmaticScroll=true;
+  _programmaticScrollSetAt=performance.now();
+  // Write-only clamp to bottom: avoids reading scrollHeight which forces synchronous reflow
+  el.scrollTop=1e9;
+  _lastScrollTop=el.scrollTop;
+  _deferClearProgrammaticScroll();
 }
 function scrollToBottom(){
   // An explicit scroll-to-bottom (End button, or any definitive pin-to-bottom)

@@ -5670,31 +5670,46 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     // the fixes below (_streamFinalized guard + cancelAnimationFrame in the
     // terminal handlers) address it without needing a reset here.
 
-    source.addEventListener('token',e=>{
-      if(_terminalStateReached||_streamFinalized) return;
-      const d=JSON.parse(e.data);
-      assistantText+=d.text;
+    let _pendingTokenChunks = [];
+    let _streamTokenRafPending = false;
+
+    function _flushTokenBuffer(){
+      if(!_streamTokenRafPending && _pendingTokenChunks.length === 0) return;
+      _streamTokenRafPending = false;
+      if(_pendingTokenChunks.length === 0) return;
+      const chunkText = _pendingTokenChunks.join('');
+      _pendingTokenChunks = [];
+      if(!chunkText) return;
+
+      assistantText += chunkText;
       syncInflightAssistantMessage();
-      if(!S.session||S.session.session_id!==activeSid) return;
+      if(!S.session || S.session.session_id !== activeSid) return;
       _completeAutomaticCompressionOnLiveProgress(activeSid);
       if(_freshSegment) appendThinking('', _liveThinkingPlacement());
-      // Once the assistant row exists its creation gate is already satisfied, and
-      // the throttled _doRender re-parses once per frame anyway — so the per-token
-      // full-text parse here is pure waste (O(n)/token -> O(n^2) over the answer).
-      // Still call ensureAssistantRow() every token exactly as before (cheap; it
-      // also starts a new segment on a post-tool _freshSegment). Only the parse is
-      // skipped, and only once the row exists. (#5455 WS2.3)
       if(assistantRow){
         ensureAssistantRow();
         _scheduleRender();
       }else{
-        const parsed=_parseStreamState();
-        if(String((parsed&&parsed.displayText)||'').trim()) ensureAssistantRow();
+        const parsed = _parseStreamState();
+        if(String((parsed && parsed.displayText) || '').trim()) ensureAssistantRow();
         _scheduleRender(parsed);
+      }
+    }
+
+    source.addEventListener('token',e=>{
+      if(_terminalStateReached||_streamFinalized) return;
+      const d=JSON.parse(e.data);
+      if(d && typeof d.text === 'string' && d.text.length > 0){
+        _pendingTokenChunks.push(d.text);
+      }
+      if(!_streamTokenRafPending){
+        _streamTokenRafPending = true;
+        requestAnimationFrame(_flushTokenBuffer);
       }
     });
 
     source.addEventListener('interim_assistant',e=>{
+      _flushTokenBuffer();
       if(_terminalStateReached||_streamFinalized) return;
       const d=JSON.parse(e.data);
       const visible=String(d&&d.text?d.text:'').trim();
@@ -5778,6 +5793,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     });
 
     source.addEventListener('reasoning',e=>{
+      _flushTokenBuffer();
       if(_terminalStateReached||_streamFinalized) return;
       if(!_ownsActiveStreamOrBackground()) return;
       const d=JSON.parse(e.data);
@@ -5801,6 +5817,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     });
 
     source.addEventListener('tool',e=>{
+      _flushTokenBuffer();
       if(_terminalStateReached||_streamFinalized) return;
       if(!S.session||S.session.session_id!==activeSid||S.activeStreamId!==streamId) return;
       const d=JSON.parse(e.data);
@@ -6053,6 +6070,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     });
 
     source.addEventListener('done',e=>{
+      _flushTokenBuffer();
       if(_streamFinalized) return;
       _clearStreamEndRecovery();
       if(_bailOutOfTerminalEventsFromStaleStream(source)) return;
@@ -6368,6 +6386,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     });
 
     source.addEventListener('stream_end',async e=>{
+      _flushTokenBuffer();
       if(_streamFinalized){
         _closeSource(source);
         return;
@@ -6772,6 +6791,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     });
 
     source.addEventListener('cancel',e=>{
+      _flushTokenBuffer();
       if(_bailOutOfTerminalEventsFromStaleStream(source)) return;
       _clearStreamEndRecovery();
       _terminalStateReached=true;
