@@ -6951,17 +6951,7 @@ function _setMessageScrollToBottom(){
   _lastScrollTop=el.scrollTop;
   _nearBottomCount=2;
   _scrollPinned=true;
-  requestAnimationFrame(()=>{
-    if(_messageUserUnpinned || !_scrollPinned || _recentNonMessageScrollIntent()){
-      _deferClearProgrammaticScroll();
-      return;
-    }
-    el.scrollTop=1e9;
-    _lastScrollTop=el.scrollTop;
-    _nearBottomCount=2;
-    _scrollPinned=true;
-    _deferClearProgrammaticScroll();
-  });
+  _deferClearProgrammaticScroll();
 }
 function _isMessagePaneNearBottom(threshold=250){
   const el=$('messages');
@@ -7104,7 +7094,8 @@ function _settleFinalScroll(token){
   _scrollPinned=true;
   _deferClearProgrammaticScroll();
 }
-function scrollIfPinned(){
+function scrollIfPinned(options){
+  if(options && options.didCommitNewDom === false) return;
   if(!window._autoScrollFollow) return;
   // A jump-to-question owner is mid-flight: it deliberately holds the reader at
   // the jump target across smooth-scroll frames, so never let a live token

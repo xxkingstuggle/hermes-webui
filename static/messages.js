@@ -2227,6 +2227,9 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     // anchor registry (identity-guarded, so it can't clobber the newer stream's
     // registry for the same session) before closing. (Codex leak catch.)
     _scheduleAnchorRegistryCleanup(120000);
+    _streamFinalized=true;
+    _cancelAnimationFramePendingStreamRender();
+    _streamFadeCleanupReduceMotionListener();
     _closeSource(source);
     return true;
   }
@@ -2673,6 +2676,8 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   let _streamFadeReduceMotionMql=null;
   let _streamFadeReduceMotion=false;
   let _streamFadeReduceMotionOnChange=null;
+  let _streamVisibilityHandler=null;
+  let _streamVisibilityListenerAttached=false;
   let _currentActivityBurstId=Number((INFLIGHT[activeSid]&&INFLIGHT[activeSid].currentActivityBurstId)||0)||0;
   let _currentLiveSegmentSeq=Number((INFLIGHT[activeSid]&&INFLIGHT[activeSid].currentLiveSegmentSeq)||0)||0;
   let _assistantSegmentSeq=Number((INFLIGHT[activeSid]&&INFLIGHT[activeSid].currentLiveSegmentSeq)||0)||0;
@@ -4542,11 +4547,17 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     _streamFadeSilentPrefixChars=0;
   }
   function _cancelAnimationFramePendingStreamRender(){
-    if(_pendingRafHandle===null) return;
-    cancelAnimationFrame(_pendingRafHandle);
-    clearTimeout(_pendingRafHandle);
-    _pendingRafHandle=null;
-    _renderPending=false;
+    if(_pendingRafHandle!==null){
+      cancelAnimationFrame(_pendingRafHandle);
+      clearTimeout(_pendingRafHandle);
+      _pendingRafHandle=null;
+      _renderPending=false;
+    }
+    if(_streamFinalized&&_streamVisibilityListenerAttached&&_streamVisibilityHandler&&typeof document!=='undefined'){
+      document.removeEventListener('visibilitychange',_streamVisibilityHandler);
+      _streamVisibilityListenerAttached=false;
+      _streamVisibilityHandler=null;
+    }
   }
   function _shouldUseStreamFade(){
     return window._fadeTextEffect===true;
@@ -5546,90 +5557,132 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   let _cachedParsed=null;
   let _cachedParsedText='';
   let _cachedParsedReasoning='';
-  function _scheduleRender(parsed){
+  let _pendingTokenChunks=[];
+
+  function _flushPendingTokenState(){
+    if(_pendingTokenChunks.length===0) return false;
+    const chunkText=_pendingTokenChunks.join('');
+    _pendingTokenChunks=[];
+    if(!chunkText) return false;
+    assistantText+=chunkText;
+    // State ownership is independent of the visible pane. A stream must keep
+    // its INFLIGHT transcript current while the user views another session;
+    // only DOM work is gated by _isActiveSession().
+    syncInflightAssistantMessage();
+    return true;
+  }
+
+  function _scheduleRender(parsed, options={}){
     // If caller provides a pre-computed parse result, cache it for _doRender.
     if(parsed){
       _cachedParsed=parsed;
       _cachedParsedText=assistantText;
       _cachedParsedReasoning=liveReasoningText;
     }
+    if(options && options.immediate){
+      if(_pendingRafHandle){
+        cancelAnimationFrame(_pendingRafHandle);
+        clearTimeout(_pendingRafHandle);
+        _pendingRafHandle=null;
+      }
+      _renderPending=false;
+      _doRender({immediate:true});
+      return;
+    }
     if(_renderPending) return;
     if(_streamFinalized) return; // Bug A: don't schedule new rAF after stream finalized
     // #6449: guard — this stream's session is no longer the active frontend pane.
-    // Drop the scheduled render instead of writing into a detached or wrong-session DOM.
-    // Callers (token/interim_assistant handlers) already gate on _isActiveSession(), but
-    // the rAF/setTimeout window between schedule and execution can outlive a session switch.
     if(!_isActiveSession()) return;
     _renderPending=true;
-    // Cap render rate to ~15fps. The browser's rAF fires at 60fps, but each DOM
-    // update takes 50-150ms on large sessions. During GC pauses, rAF callbacks
-    // accumulate and then execute all at once, blocking the main thread for
-    // multi-second stretches and crashing the renderer (Chrome error code 4/5).
-    // Throttling to 66ms intervals prevents this pileup without noticeable
-    // visual degradation — streaming text updates still feel immediate.
-    // performance.now() is monotonic so tab suspend/resume and NTP adjustments
-    // cannot produce negative or enormous deltas.
+
+    // Coalesce further when window/tab is hidden or occluded (~4fps / 250ms),
+    // otherwise sync strictly to the ~15fps (66ms) visual render cadence.
+    const isHidden=(typeof document!=='undefined'&&document.hidden);
+    const frameIntervalMs=isHidden?250:(_shouldUseLiveProseFade()?33:66);
     const sinceLastMs=performance.now()-_lastRenderMs;
-    const _doRender=()=>{
-      _pendingRafHandle=null;
-      _renderPending=false;
-      // Guard: a pending setTimeout+rAF can outlive stream finalization.
-      if(_streamFinalized) return;
-      // #6449: guard — the frontend session changed between rAF schedule and execution.
-      // Writing DOM into this stream's assistantBody would leak text into the wrong pane.
-      if(!_isActiveSession()) return;
-      // Mobile scroll-jank guard: temporarily disable overflow-anchor before DOM
-      // writes to suppress Chromium scroll re-anchoring during streaming growth.
-      if(typeof window._fixMobileScrollJank==='function') window._fixMobileScrollJank();
-      _lastRenderMs=performance.now();
-      const parsed=_cachedParsed&&_cachedParsedText===assistantText&&_cachedParsedReasoning===liveReasoningText ? _cachedParsed : _parseStreamState();
-      _cachedParsed=null;
-      _renderLiveThinking(parsed);
-      const displayText = segmentStart===0
-        ? parsed.displayText                          // first segment: uses think-tag stripping
-        : _stripXmlToolCalls(assistantText.slice(segmentStart));
-      let anchorProcessText=displayText;
-      if(assistantBody){
-        if(_shouldUseLiveProseFade()){
-          const caughtUp=_renderStreamingFadeMarkdown(displayText);
-          anchorProcessText=_streamFadeDomText||'';
-          if(!caughtUp&&!_streamFinalized){
-            setTimeout(()=>_scheduleRender(), 33);
-          }
-        } else {
-          assistantBody.classList.remove('stream-fade-active');
-          _resetStreamFadeState();
-          if(!_smdParser&&window.smd){
-            // On reconnect: prior content in assistantBody came from a different smd parser run.
-            // Clear it and start fresh — renderMessages() on done will restore the full content.
-            if(_smdReconnect){assistantBody.innerHTML='';_smdReconnect=false;}
-            _smdNewParser(assistantBody);
-          }
+
+    if(sinceLastMs>=frameIntervalMs){
+      _pendingRafHandle=requestAnimationFrame(()=>_doRender({immediate:false}));
+    } else {
+      _pendingRafHandle=setTimeout(()=>{
+        _pendingRafHandle=requestAnimationFrame(()=>_doRender({immediate:false}));
+      }, frameIntervalMs-sinceLastMs);
+    }
+  }
+
+  _streamVisibilityHandler=()=>{
+    if(typeof document!=='undefined'&&!document.hidden&&!_streamFinalized){
+      _scheduleRender(null, {immediate:true});
+    }
+  };
+  if(typeof document!=='undefined'){
+    document.addEventListener('visibilitychange',_streamVisibilityHandler);
+    _streamVisibilityListenerAttached=true;
+  }
+
+  const _doRender=(renderOpts={})=>{
+    _pendingRafHandle=null;
+    _renderPending=false;
+    // Guard: a pending setTimeout+rAF can outlive stream finalization.
+    if(_streamFinalized) return;
+    const hasNewTokens=_flushPendingTokenState();
+    // Keep background-stream state current without touching the detached or
+    // wrong-session DOM. Reattachment renders the persisted INFLIGHT row.
+    if(!_isActiveSession()) return;
+    if(typeof window._fixMobileScrollJank==='function') window._fixMobileScrollJank();
+    _lastRenderMs=performance.now();
+
+    // 1. UNIFIED BUFFER FLUSH: state was drained once for this visual frame.
+    if(hasNewTokens){
+      _completeAutomaticCompressionOnLiveProgress(activeSid);
+      if(_freshSegment) appendThinking('', _liveThinkingPlacement());
+      ensureAssistantRow();
+    }
+
+    // 2. DOM RENDER: parse & patch visible content
+    let didCommitNewDom=false;
+    const parsed=_cachedParsed&&_cachedParsedText===assistantText&&_cachedParsedReasoning===liveReasoningText ? _cachedParsed : _parseStreamState();
+    _cachedParsed=null;
+    _renderLiveThinking(parsed);
+    const displayText = segmentStart===0
+      ? parsed.displayText                          // first segment: uses think-tag stripping
+      : _stripXmlToolCalls(assistantText.slice(segmentStart));
+    let anchorProcessText=displayText;
+    if(assistantBody){
+      if(_shouldUseLiveProseFade()){
+        const caughtUp=_renderStreamingFadeMarkdown(displayText);
+        anchorProcessText=_streamFadeDomText||'';
+        if(!caughtUp&&!_streamFinalized){
+          setTimeout(()=>_scheduleRender(), 33);
+        }
+      } else {
+        assistantBody.classList.remove('stream-fade-active');
+        _resetStreamFadeState();
+        if(!_smdParser&&window.smd){
+          // On reconnect: prior content in assistantBody came from a different smd parser run.
+          if(_smdReconnect){assistantBody.innerHTML='';_smdReconnect=false;}
+          _smdNewParser(assistantBody);
+        }
         if(_smdParser){
           _smdWrite(displayText);
         } else {
-            // Fallback: smd not loaded yet, reconnect session, or smd unavailable — use renderMd
-            // for every live segment. Without this, the first segment inserts raw
-            // parsed.displayText and users see unformatted markdown until done.
-            const fallbackText = segmentStart===0
-              ? parsed.displayText
-              : _stripXmlToolCalls(assistantText.slice(segmentStart));
-            assistantBody.innerHTML = renderMd ? renderMd(fallbackText) : esc(fallbackText);
-          }
+          const fallbackText = segmentStart===0
+            ? parsed.displayText
+            : _stripXmlToolCalls(assistantText.slice(segmentStart));
+          assistantBody.innerHTML = renderMd ? renderMd(fallbackText) : esc(fallbackText);
         }
-        if(typeof _syncLiveWorklogReasonsForAnchor==='function') _syncLiveWorklogReasonsForAnchor(assistantRow, displayText);
       }
-      if(anchorProcessText) _upsertAnchorProcessProse(anchorProcessText);
-      scrollIfPinned();
-      _throttledSnapshotLiveTurn();
-    };
-    const frameIntervalMs=_shouldUseLiveProseFade()?33:66;
-    if(sinceLastMs>=frameIntervalMs){
-      _pendingRafHandle=requestAnimationFrame(_doRender);
-    } else {
-      _pendingRafHandle=setTimeout(()=>requestAnimationFrame(_doRender), frameIntervalMs-sinceLastMs);
+      if(typeof _syncLiveWorklogReasonsForAnchor==='function') _syncLiveWorklogReasonsForAnchor(assistantRow, displayText);
+      didCommitNewDom=hasNewTokens||!!displayText;
     }
-  }
+    if(anchorProcessText) _upsertAnchorProcessProse(anchorProcessText);
+
+    // 3. AUTO-FOLLOW: write scrollTop ONLY if new visible DOM was actually committed
+    if(didCommitNewDom){
+      scrollIfPinned({didCommitNewDom:true});
+    }
+    _throttledSnapshotLiveTurn();
+  };
 
   function _completeAutomaticCompressionOnLiveProgress(sessionId){
     const sid=String(sessionId||'');
@@ -5670,30 +5723,8 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     // the fixes below (_streamFinalized guard + cancelAnimationFrame in the
     // terminal handlers) address it without needing a reset here.
 
-    let _pendingTokenChunks = [];
-    let _streamTokenRafPending = false;
-
     function _flushTokenBuffer(){
-      if(!_streamTokenRafPending && _pendingTokenChunks.length === 0) return;
-      _streamTokenRafPending = false;
-      if(_pendingTokenChunks.length === 0) return;
-      const chunkText = _pendingTokenChunks.join('');
-      _pendingTokenChunks = [];
-      if(!chunkText) return;
-
-      assistantText += chunkText;
-      syncInflightAssistantMessage();
-      if(!S.session || S.session.session_id !== activeSid) return;
-      _completeAutomaticCompressionOnLiveProgress(activeSid);
-      if(_freshSegment) appendThinking('', _liveThinkingPlacement());
-      if(assistantRow){
-        ensureAssistantRow();
-        _scheduleRender();
-      }else{
-        const parsed = _parseStreamState();
-        if(String((parsed && parsed.displayText) || '').trim()) ensureAssistantRow();
-        _scheduleRender(parsed);
-      }
+      _scheduleRender(null, {immediate:true});
     }
 
     source.addEventListener('token',e=>{
@@ -5702,10 +5733,12 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       if(d && typeof d.text === 'string' && d.text.length > 0){
         _pendingTokenChunks.push(d.text);
       }
-      if(!_streamTokenRafPending){
-        _streamTokenRafPending = true;
-        requestAnimationFrame(_flushTokenBuffer);
+
+      if(!_isActiveSession()){
+        _flushPendingTokenState();
+        return;
       }
+      _scheduleRender();
     });
 
     source.addEventListener('interim_assistant',e=>{
