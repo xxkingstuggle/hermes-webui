@@ -15,6 +15,9 @@ from typing import Any
 
 DEFAULT_SLOW_REQUEST_SECONDS = 5.0
 MAX_STACK_FRAMES_PER_THREAD = 40
+MAX_STACK_THREADS = 16
+MAX_STACK_LINE_CHARS = 1000
+MAX_SLOW_LOG_CHARS = 64_000
 
 # Process-global watchdog: a single daemon thread scans all in-flight
 # RequestDiagnostics instances instead of each request spawning its own
@@ -185,6 +188,8 @@ class RequestDiagnostics:
 
     def _emit_slow(self, prefix: str, record: dict) -> None:
         payload = json.dumps(record, sort_keys=True)
+        if len(payload) > MAX_SLOW_LOG_CHARS:
+            payload = payload[:MAX_SLOW_LOG_CHARS] + '...[truncated]'
         log_msg = f"{prefix} %s"
         if self._print_fn is not None:
             try:
@@ -244,7 +249,14 @@ def _thread_stack_snapshot() -> list[dict[str, Any]]:
     frames = sys._current_frames()
     threads = {thread.ident: thread for thread in threading.enumerate()}
     snapshot: list[dict[str, Any]] = []
-    for ident, frame in frames.items():
+    # Snapshot a bounded number of threads. A busy WebUI can have hundreds of
+    # request/worker threads; serializing all of them from the watchdog itself
+    # amplified a slow request into a CPU and memory spike.
+    ordered_frames = sorted(
+        frames.items(),
+        key=lambda item: (str(getattr(threads.get(item[0]), "name", "")), item[0]),
+    )[:MAX_STACK_THREADS]
+    for ident, frame in ordered_frames:
         thread = threads.get(ident)
         stack = traceback.format_stack(frame, limit=MAX_STACK_FRAMES_PER_THREAD)
         snapshot.append(
@@ -252,7 +264,7 @@ def _thread_stack_snapshot() -> list[dict[str, Any]]:
                 "thread_id": ident,
                 "thread_name": thread.name if thread else "",
                 "daemon": bool(thread.daemon) if thread else None,
-                "stack": [line.rstrip() for line in stack],
+                "stack": [line.rstrip()[:MAX_STACK_LINE_CHARS] for line in stack],
             }
         )
     snapshot.sort(key=lambda item: str(item.get("thread_name") or ""))

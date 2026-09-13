@@ -17,6 +17,34 @@ def test_messages_zero_skips_effective_model_resolution():
     assert 'resolve_model_default = "1" if load_messages else "0"' in src
 
 
+def test_messages_zero_drops_heavy_runtime_and_recovery_payloads():
+    src = (ROOT / "api" / "routes.py").read_text(encoding="utf-8")
+
+    assert "if journal_active and load_messages and msg_limit is None:" in src
+    for field in (
+        "pre_compression_snapshot",
+        "compression_anchor_details",
+        "context_engine_state",
+    ):
+        assert f'"{field}",' in src
+    assert "raw.pop(_heavy_metadata_field, None)" in src
+    assert 'raw.pop("runtime_journal_snapshot", None)' in src
+    assert 'raw.pop("todo_state", None)' in src
+    assert "if not load_messages or msg_limit is not None:" in src
+
+
+def test_idle_render_does_not_schedule_geometry_reanchor():
+    src = (ROOT / "static" / "ui.js").read_text(encoding="utf-8")
+
+    assert "if(!S||(!S.busy&&!S.activeStreamId)) return;" in src
+    assert "if((S.busy||S.activeStreamId) && typeof queueMicrotask" in src
+    assert "_messageVirtualMeasurementCycleKey=cycleKey;" in src
+    assert "_messageVirtualMeasurementRetryCount=0;\n  }" not in src[
+        src.index("function _scheduleMessageVirtualMeasurementRefresh"):
+        src.index("function _markMessageVirtualMeasurementsSettled")
+    ]
+
+
 def test_full_message_load_updates_viewed_count_after_metadata_fast_path():
     src = (ROOT / "static" / "sessions.js").read_text(encoding="utf-8")
     compact = re.sub(r"\s+", "", src)

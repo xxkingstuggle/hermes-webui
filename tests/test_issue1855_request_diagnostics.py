@@ -4,6 +4,7 @@ from pathlib import Path
 
 import api.models as models
 from api.models import Session
+from api import request_diagnostics
 from api.request_diagnostics import RequestDiagnostics
 
 
@@ -37,6 +38,24 @@ def test_request_diagnostics_timeout_record_includes_stage_and_thread_stacks(cap
     assert record["elapsed_ms"] >= 0
     assert any(stage["name"] == "all_sessions.read_index" for stage in record["stages"])
     assert record["thread_stacks"]
+
+
+def test_request_diagnostics_stack_and_log_payloads_are_bounded(monkeypatch):
+    fake_frames = {idx: object() for idx in range(request_diagnostics.MAX_STACK_THREADS + 5)}
+    monkeypatch.setattr(request_diagnostics.sys, "_current_frames", lambda: fake_frames)
+    monkeypatch.setattr(request_diagnostics.traceback, "format_stack", lambda frame, limit: ["x" * 2000] * limit)
+    monkeypatch.setattr(request_diagnostics.threading, "enumerate", lambda: [])
+
+    snapshot = request_diagnostics._thread_stack_snapshot()
+
+    assert len(snapshot) == request_diagnostics.MAX_STACK_THREADS
+    assert all(len(line) <= request_diagnostics.MAX_STACK_LINE_CHARS for row in snapshot for line in row["stack"])
+
+    emitted = []
+    diag = RequestDiagnostics("GET", "/api/session", auto_start=False, print_fn=emitted.append)
+    diag._emit_slow("slow", {"payload": "y" * (request_diagnostics.MAX_SLOW_LOG_CHARS * 2)})
+    assert len(emitted[0]) <= request_diagnostics.MAX_SLOW_LOG_CHARS + 64
+    assert emitted[0].endswith("...[truncated]")
 
 
 def test_request_diagnostics_maybe_start_is_limited_to_issue1855_paths():

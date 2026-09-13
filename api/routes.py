@@ -13094,7 +13094,11 @@ def handle_get(handler, parsed) -> bool:
                         journal,
                         active=journal_active,
                     )
-                    if journal_active and (not load_messages or msg_limit is None):
+                    # A metadata-only request must stay metadata-only. Building
+                    # a live journal snapshot walks/copies the full run journal
+                    # (multi-megabyte on long tool runs) and made sidebar polls
+                    # as expensive as opening the transcript.
+                    if journal_active and load_messages and msg_limit is None:
                         try:
                             snapshot = _run_journal_live_snapshot(original_stream_id, handler=handler)
                         except Exception:
@@ -13153,6 +13157,20 @@ def handle_get(handler, parsed) -> bool:
                 raw["model"] = effective_model
             if effective_provider:
                 raw["model_provider"] = effective_provider
+            if not load_messages or msg_limit is not None:
+                # compact() intentionally carries rich recovery/context fields
+                # for an unbounded recovery load. They may embed old messages
+                # and tool payloads, so copying/redacting them defeats both the
+                # metadata path and the bounded initial transcript window.
+                for _heavy_metadata_field in (
+                    "pre_compression_snapshot",
+                    "compression_anchor_details",
+                    "context_engine_state",
+                ):
+                    raw.pop(_heavy_metadata_field, None)
+            if not load_messages:
+                raw.pop("runtime_journal_snapshot", None)
+                raw.pop("todo_state", None)
             # A subagent child (#5307) is view-only regardless of what a stale
             # sidecar stored: coerce the serialized flags so the browser never
             # treats an existing subagent sidecar as writable / CLI-classified.

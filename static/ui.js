@@ -587,6 +587,7 @@ function clearVisibleMessageRowCache(){
   _visWithIdxCacheSrc=null;
 }
 function _clearMessageVirtualHeightCache(){
+  _cancelMessageVirtualizedRender();
   _messageVirtualHeightCache=[];
   _messageVirtualHeightCacheEntries=[];
   _messageVirtualHeightCacheLen=0;
@@ -602,6 +603,7 @@ function _clearMessageVirtualHeightCache(){
   if(typeof _clearUserRowIntrinsicHeightCache==='function') _clearUserRowIntrinsicHeightCache();
 }
 function _resetMessageRenderWindow(sid){
+  if(typeof _cancelBottomSettle==='function') _cancelBottomSettle();
   _messageRenderWindowSid=sid||null;
   _messageRenderWindowSize=MESSAGE_RENDER_WINDOW_DEFAULT;
   _cancelMessageVirtualizedRender();
@@ -725,10 +727,11 @@ function _scheduleMessageVirtualMeasurementRefresh(windowMetrics){
     return;
   }
   const cycleKey=_messageVirtualMeasurementCycleKeyFor(windowMetrics);
-  if(_messageVirtualMeasurementCycleKey!==cycleKey){
-    _messageVirtualMeasurementCycleKey=cycleKey;
-    _messageVirtualMeasurementRetryCount=0;
-  }
+  // Do not reset the retry budget merely because measuring/rebuilding changed
+  // the virtual window.  On WebKit, fractional flex/text metrics can move that
+  // window by one row on every rebuild; resetting here turns the intended two
+  // settle passes into a permanent rAF -> render -> layout loop at idle.
+  _messageVirtualMeasurementCycleKey=cycleKey;
   if(_messageVirtualMeasurementRetryCount>=MESSAGE_VIRTUAL_MEASUREMENT_MAX_RERENDERS) return;
   _messageVirtualMeasurementRetryCount++;
   requestAnimationFrame(()=>{ _scheduleMessageVirtualizedRender(true); });
@@ -16132,6 +16135,9 @@ function _assistantTurnAnchorSettledFinalAnswer(message, content, context){
 // this write as a manual unpin. Idempotent: a no-op once scrollTop already equals the max.
 function _reanchorPinnedTailAfterRender(wasNearTail){
   if(!wasNearTail) return;
+  // This correction exists only for a growing live transcript.  Idle/session
+  // reload renders must not synchronously read the height of a long flex tree.
+  if(!S||(!S.busy&&!S.activeStreamId)) return;
   const el=$('messages');
   if(!el) return;
   const settledMax=Math.max(0, el.scrollHeight-el.clientHeight);
@@ -17918,7 +17924,7 @@ function renderMessages(options){
   // the unpinned jump-back class). See _reanchorPinnedTailAfterRender for the full rationale.
   // (typeof guards mirror the _deferClearProgrammaticScroll call below so standalone
   // renderMessages() test harnesses that don't define these helpers still run.)
-  if(typeof queueMicrotask==='function' && typeof _reanchorPinnedTailAfterRender==='function'){
+  if((S.busy||S.activeStreamId) && typeof queueMicrotask==='function' && typeof _reanchorPinnedTailAfterRender==='function'){
     queueMicrotask(()=>_reanchorPinnedTailAfterRender(_preWipeNearTail));
   }
   _recycleStash.clear();

@@ -2259,6 +2259,10 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     delete INFLIGHT[activeSid];
     clearInflightState(activeSid);
     _clearActivePaneInflightIfOwner();
+    // Terminal/stale streams must not leave a layout-settle observer or a
+    // virtual measurement frame alive against the completed transcript.
+    if(_isActiveSession()&&typeof _cancelBottomSettle==='function') _cancelBottomSettle();
+    if(_isActiveSession()&&typeof _cancelMessageVirtualizedRender==='function') _cancelMessageVirtualizedRender();
     _resumeSessionStreamAfterLiveChat(activeSid);
   }
   function _isMarkerOnlyAssistantMessage(m){
