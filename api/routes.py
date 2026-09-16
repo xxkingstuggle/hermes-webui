@@ -17538,6 +17538,18 @@ def _parse_run_journal_after_seq(qs: dict, stream_id: str | None = None) -> int 
         return 0
 
 
+# Journal-replay pacing. A full journal for a long run can hold tens of
+# thousands of events (a 93-minute run measured ~89k rows). WebKit dispatches
+# every event of one network chunk synchronously inside a single
+# EventSource::parseEventStream pass, so delivering the whole journal in one
+# write pins the browser main thread for minutes on long transcripts — the
+# window is unresponsive, and every reconnect re-arms the same flood. Deliver
+# in bounded chunks with a small yield between them so the client can drain
+# its render/scroll work between batches.
+_JOURNAL_REPLAY_PACING_EVENTS = 100
+_JOURNAL_REPLAY_PACING_SLEEP_S = 0.04
+
+
 def _replay_run_journal(
     handler,
     stream_id: str,
@@ -17555,6 +17567,7 @@ def _replay_run_journal(
         after_seq=after_seq,
         max_seq=max_seq,
     )
+    emitted = 0
     for entry in journal.get("events") or []:
         _sse_with_id(
             handler,
@@ -17562,6 +17575,9 @@ def _replay_run_journal(
             entry.get("payload"),
             entry.get("event_id"),
         )
+        emitted += 1
+        if _JOURNAL_REPLAY_PACING_EVENTS > 0 and emitted % _JOURNAL_REPLAY_PACING_EVENTS == 0:
+            time.sleep(_JOURNAL_REPLAY_PACING_SLEEP_S)
     if include_stale and not summary.get("terminal"):
         stale = stale_interrupted_event(
             str(summary.get("session_id") or ""),
