@@ -2926,9 +2926,40 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     if(sceneMode==='hide_all_activity') return (hints&&hints.hidden_activity)||'hidden_activity';
     return row&&row.display_hint||'activity_row';
   }
+  // Frame-coalesced live-scene repaint. The reasoning/token SSE streams fire
+  // many events per second; each synchronous scene rebuild tears the live turn
+  // down and forces WebKit to re-run transcript layout (scrollHeight reads),
+  // which starved the main thread on long sessions. The scene is always
+  // re-projected from the full anchor registry at paint time, so folding every
+  // event of a frame into one rAF-scheduled paint loses nothing and the
+  // trailing paint covers the last event of a burst. Non-scene activity modes
+  // and environments without rAF keep the synchronous path so their fallback
+  // painters still see the pre-paint outcome.
+  let _anchorScenePaintRaf=0;
+  function _cancelAnchorLiveSceneRender(){
+    if(_anchorScenePaintRaf){cancelAnimationFrame(_anchorScenePaintRaf);_anchorScenePaintRaf=0;}
+  }
   function _renderAnchorLiveScene(){
     if(!_anchorRegistry||!_isActiveSession()) return false;
     if(typeof window==='undefined'||typeof window._renderLiveAnchorActivitySceneForStream!=='function') return false;
+    const sceneMode=_anchorSceneActiveMode();
+    const sceneSimplified=(typeof isSimplifiedToolCalling!=='function')||!!isSimplifiedToolCalling();
+    if(typeof requestAnimationFrame==='function'&&(sceneMode==='transparent_stream'||(sceneMode==='compact_worklog'&&sceneSimplified))){
+      if(!_anchorScenePaintRaf&&!_streamFinalized){
+        _anchorScenePaintRaf=requestAnimationFrame(()=>{
+          _anchorScenePaintRaf=0;
+          if(_streamFinalized||!_isActiveSession()) return;
+          _renderAnchorLiveSceneNow();
+        });
+      }
+      return true;
+    }
+    return _renderAnchorLiveSceneNow();
+  }
+  function _renderAnchorLiveSceneNow(){
+    if(!_anchorRegistry||!_isActiveSession()) return false;
+    if(typeof window==='undefined'||typeof window._renderLiveAnchorActivitySceneForStream!=='function') return false;
+    if(typeof _anchorPerfBump==='function') _anchorPerfBump('fullSceneRebuilds');
     try{
       return !!window._renderLiveAnchorActivitySceneForStream(streamId, activeSid, {
         mode:_anchorSceneActiveMode(),
@@ -2940,6 +2971,66 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       }
       return false;
     }
+  }
+  // Patch 2 diagnostics: minimal counters for the incremental-refresh fast path
+  // vs the full scene rebuild. Temporary; read via window.__anchorPerf in tests,
+  // safe to strip once the growth curve is verified.
+  function _anchorPerfBump(key){
+    if(typeof window==='undefined') return;
+    const perf=window.__anchorPerf=window.__anchorPerf||{reasoningIncrementalUpdates:0,proseIncrementalUpdates:0,fullSceneRebuilds:0,incrementalFallbacks:0};
+    perf[key]=(perf[key]||0)+1;
+  }
+  // Fast-path gate mirrors _renderAnchorLiveScene's: only the two scene modes
+  // with a live scene painter may refresh rows in place; anything else keeps
+  // the legacy rebuild/fallback behavior.
+  function _anchorInPlaceRefreshAllowed(){
+    if(_streamFinalized||!_isActiveSession()) return false;
+    const sceneMode=_anchorSceneActiveMode();
+    const sceneSimplified=(typeof isSimplifiedToolCalling!=='function')||!!isSimplifiedToolCalling();
+    return sceneMode==='transparent_stream'||(sceneMode==='compact_worklog'&&sceneSimplified);
+  }
+  // Patch 2 Step 1: update an EXISTING reasoning row's text in place instead of
+  // tearing down and rebuilding the whole live scene (cost grew with scene rows
+  // N: 4.5+0.078*N ms per event, the dominant long-task degradation). Only the
+  // row body is rewritten; row add/remove/reorder and the sealed final flush
+  // still take the full rebuild below. Returns true when the row was refreshed.
+  function _refreshLiveAnchorReasoningRowInPlace(localId,text){
+    if(!localId||!_anchorInPlaceRefreshAllowed()) return false;
+    if(typeof window==='undefined'||typeof window._updateLiveAnchorReasoningRowForFallback!=='function') return false;
+    const turn=$('liveAssistantTurn');
+    if(!turn) return false;
+    try{
+      return !!window._updateLiveAnchorReasoningRowForFallback(turn, String(text||''), {
+        localId,
+        streamId,
+        sessionId:activeSid,
+        ts:Date.now()/1000,
+      });
+    }catch(_){
+      return false;
+    }
+  }
+  // Patch 2 Step 2: same for an EXISTING anchor prose row — feed the delta into
+  // the persistent incremental smd node that IS the mounted row. Requires the
+  // mounted row to be that same node; anything else falls back to the rebuild.
+  function _refreshLiveAnchorProseRowInPlace(localId,text){
+    if(!localId||!_anchorInPlaceRefreshAllowed()) return false;
+    if(typeof window==='undefined'||typeof window.__anchorProseIncrementalNode!=='function') return false;
+    if(typeof document==='undefined') return false;
+    let row=null;
+    try{
+      row=document.querySelector(`[data-anchor-scene-row="1"][data-anchor-local-id="${CSS.escape(localId)}"]`);
+    }catch(_){ return false; }
+    if(!row) return false;
+    let node=null;
+    try{ node=window.__anchorProseIncrementalNode(localId,String(text||''),{}); }catch(_){ node=null; }
+    if(!node||node!==row) return false;
+    if(typeof scrollIfPinned==='function') scrollIfPinned();
+    return true;
+  }
+  if(typeof window!=='undefined'){
+    window._anchorInPlaceReasoningRefresh=_refreshLiveAnchorReasoningRowInPlace;
+    window._anchorInPlaceProseRefresh=_refreshLiveAnchorProseRowInPlace;
   }
   function _projectLiveAnchorActivityScene(){
     if(!_anchorRegistry||!_anchorApi||typeof _anchorApi.projectAssistantTurnAnchorActivityScene!=='function') return null;
@@ -3967,6 +4058,14 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         status:options.sealed?'completed':'running',
         payload:{text,activitySegmentSeq:segmentSeq,activityBurstId:_currentActivityBurstId},
       });
+      // Patch 2 fast path: append-only prose updates refresh the mounted
+      // incremental row in place. Sealed flushes and missing/mismatched rows
+      // keep the full rebuild.
+      if(!options.sealed&&_refreshLiveAnchorProseRowInPlace(localId,text)){
+        _anchorPerfBump('proseIncrementalUpdates');
+        return replaced;
+      }
+      _anchorPerfBump('incrementalFallbacks');
       _renderAnchorLiveScene();
       return replaced;
     }
@@ -4129,6 +4228,14 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         status:options.sealed?'completed':'running',
         payload:{text:clean,activitySegmentSeq:segmentSeq,activityBurstId:_currentActivityBurstId},
       });
+      // Patch 2 fast path: an UNSERALED update of an already-registered reasoning
+      // event only rewrites that row's text. Structural changes (sealed flush,
+      // missing row) still take the full scene rebuild below.
+      if(!options.sealed&&_refreshLiveAnchorReasoningRowInPlace(localId,clean)){
+        _anchorPerfBump('reasoningIncrementalUpdates');
+        return replaced;
+      }
+      _anchorPerfBump('incrementalFallbacks');
       return _renderAnchorLiveScene()?replaced:null;
     }
     const renderOutcome={rendered:false};
@@ -4604,6 +4711,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     _streamFadeSilentPrefixChars=0;
   }
   function _cancelAnimationFramePendingStreamRender(){
+    _cancelAnchorLiveSceneRender();
     if(_pendingRafHandle!==null){
       cancelAnimationFrame(_pendingRafHandle);
       clearTimeout(_pendingRafHandle);
