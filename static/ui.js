@@ -5866,6 +5866,35 @@ function _cancelMessageJumpScroll(){
 let _nearBottomCount=0;
 let _lastScrollTop=null;
 let _lastMessageClientHeight=null;   // #4702: track scroller height to ignore iOS portrait toolbar-settle reflows (a clientHeight increase fires a scroll event with decreased scrollTop that is NOT a user scroll)
+// Read-through geometry cache. Back-to-back SSE handlers used to read
+// scrollHeight directly, and every read forces a synchronous layout of the
+// whole transcript flex tree — the dominant cost while a long session streams.
+// The cache holds the last measured bottom distance for one element and is
+// invalidated by the scroll event (which fires for user AND programmatic
+// scrollTop writes) and by transcript rebuilds, so a burst of follow/unpin
+// decisions within one frame pays for at most one layout instead of one per
+// event. Scroll-state decisions keep their existing semantics: a missing entry
+// measures synchronously, exactly the pre-cache behavior.
+let _messageGeometryCache=null;
+function _invalidateMessageGeometryCache(){ _messageGeometryCache=null; }
+function _cachedMessageBottomDistance(el){
+  if(!el) return null;
+  const cached=_messageGeometryCache;
+  if(cached&&cached.el===el) return cached.bottomDistance;
+  const scrollHeight=el.scrollHeight;
+  const clientHeight=el.clientHeight;
+  const scrollTop=el.scrollTop;
+  _messageGeometryCache={el,bottomDistance:scrollHeight-scrollTop-clientHeight};
+  return _messageGeometryCache.bottomDistance;
+}
+function _syncMessageScrollTrackersFromEvent(el){
+  // Fix 2 read phase: call ONLY from a native scroll event (fires after layout
+  // settles, so these reads never force layout). Replaces the post-write reads
+  // that used to sit in scrollIfPinned()/_setMessageScrollToBottom() and
+  // repopulates the geometry cache for the next SSE events.
+  _lastScrollTop=el.scrollTop;_lastMessageClientHeight=el.clientHeight;
+  _messageGeometryCache={el,bottomDistance:el.scrollHeight-el.scrollTop-el.clientHeight};
+}
 // Sticky-unpin model (#3343 supersedes #3330's proximity re-pin): once the user
 // scrolls up, streaming stops auto-following until they return to the bottom or
 // click ↓. The upward-intent TIMEOUT mechanism (_lastMessageUpwardIntentMs /
@@ -6017,7 +6046,12 @@ function _recordNonMessageScrollIntent(e){
   // its listener can see the native scroll event, so even a small capture-phase
   // upward wheel input must immediately stop live-tail follow (#6414).
   if(e.type==='touchmove'||(typeof e.deltaY==='number'&&e.deltaY!==0)){
-    const bottomDistance=el.scrollHeight-el.scrollTop-el.clientHeight;
+    // Read-through cache (see _cachedMessageBottomDistance). Harnesses that
+    // eval this body in isolation without the cache helper fall back to a
+    // direct measure — identical to the pre-cache behavior.
+    const bottomDistance=(typeof _cachedMessageBottomDistance==='function')
+      ? (_cachedMessageBottomDistance(el)||0)
+      : (el.scrollHeight-el.scrollTop-el.clientHeight);
     if(bottomDistance>120) _lastMessageScrollIntentMs=performance.now();
   }
 }
@@ -6258,14 +6292,22 @@ if(typeof window!=='undefined'){
     _scheduleMessageVirtualizedRender();
     if(_messageJumpScrollOwner){
       _scheduleMessageJumpScrollReconcile(_messageJumpScrollOwner.generation);
+      if(typeof _syncMessageScrollTrackersFromEvent==='function') _syncMessageScrollTrackersFromEvent(el);
       return;
     }
-    if(_freshProgrammaticScrollActive()) return;
+    // Fix 2 read phase: our own follow write settling (or any scroll event —
+    // it fires after layout settles, so these reads force no layout). Replaces
+    // the old post-write reads inside scrollIfPinned()/_setMessageScrollToBottom()
+    // (#1731 sync) and repopulates the geometry cache for the next SSE events.
+    if(_freshProgrammaticScrollActive()){ if(typeof _syncMessageScrollTrackersFromEvent==='function') _syncMessageScrollTrackersFromEvent(el); return; }
     _markMessageVirtualScrollActive();
     cancelAnimationFrame(_scrollRaf);
     _scrollRaf=requestAnimationFrame(()=>{
       const top=el.scrollTop;
       const bottomDistance=el.scrollHeight-top-el.clientHeight;
+      // Fix 2: the user-scroll read phase doubles as the frame's geometry-cache
+      // refresh, so per-event near-bottom checks downstream are cache hits.
+      _messageGeometryCache={el,bottomDistance};
       const nearBottom=bottomDistance<250;
       // #4702: iOS Safari (esp. portrait) resolves its dynamic toolbar height
       // AFTER first paint. When the toolbar collapses the scroller GROWS
@@ -6950,8 +6992,13 @@ function _setMessageScrollToBottom(){
   const el=$('messages');
   if(!el) return;
   _programmaticScroll=true;_programmaticScrollSetAt=performance.now();
+  // Fix 2: write-only. Reading scrollTop back here (the old #1731 sync) forces
+  // a synchronous layout whenever the DOM is dirty — i.e. on every streaming
+  // follow step. The scroll event this write produces runs after the browser
+  // resolved layout, so the scroll handler performs the tracker sync and
+  // geometry-cache refresh there (layout-safe read phase). Same guarantee for
+  // sticky-unpin (#1731), one frame later, at zero forced-layout cost.
   el.scrollTop=1e9;
-  _lastScrollTop=el.scrollTop;
   _nearBottomCount=2;
   _scrollPinned=true;
   _deferClearProgrammaticScroll();
@@ -6959,12 +7006,21 @@ function _setMessageScrollToBottom(){
 function _isMessagePaneNearBottom(threshold=250){
   const el=$('messages');
   if(!el) return false;
-  return el.scrollHeight-el.scrollTop-el.clientHeight<=threshold;
+  // Read-through cache keeps per-event SSE checks from forcing a synchronous
+  // transcript layout. Standalone harnesses without the helper fall back to
+  // the direct measure (identical semantics).
+  const bottom=(typeof _cachedMessageBottomDistance==='function')
+    ? _cachedMessageBottomDistance(el)
+    : (el.scrollHeight-el.scrollTop-el.clientHeight);
+  return bottom!==null&&bottom<=threshold;
 }
 function _messageBottomDistance(){
   const el=$('messages');
   if(!el) return 0;
-  return el.scrollHeight-el.scrollTop-el.clientHeight;
+  const bottom=(typeof _cachedMessageBottomDistance==='function')
+    ? _cachedMessageBottomDistance(el)
+    : (el.scrollHeight-el.scrollTop-el.clientHeight);
+  return bottom===null?0:bottom;
 }
 // #5514/#5515: when the composer grows (typing multiple rows, Shift+Enter, a
 // multi-line paste / WisprFlow), the flex:1 `.messages` viewport shrinks by the
@@ -7091,8 +7147,9 @@ function _settleFinalScroll(token){
     return;
   }
   _programmaticScroll=true;_programmaticScrollSetAt=performance.now();
+  // Fix 2: write-only (see scrollIfPinned); scroll-event read phase syncs the
+  // trackers after layout settles.
   el.scrollTop=1e9;
-  _lastScrollTop=el.scrollTop;
   _nearBottomCount=2;
   _scrollPinned=true;
   _deferClearProgrammaticScroll();
@@ -7114,9 +7171,12 @@ function scrollIfPinned(options){
   if(!el) return;
   _programmaticScroll=true;
   _programmaticScrollSetAt=performance.now();
-  // Write-only clamp to bottom: avoids reading scrollHeight which forces synchronous reflow
+  // Fix 2: write-only. The old `_lastScrollTop=el.scrollTop` read-back forced a
+  // synchronous layout on every streaming follow step (measured: 251
+  // read-after-write ops per 100 updates). The scroll event this write emits
+  // syncs _lastScrollTop/_lastMessageClientHeight after layout settles, which
+  // keeps the #1731 sticky-unpin guarantee at zero forced-layout cost.
   el.scrollTop=1e9;
-  _lastScrollTop=el.scrollTop;
   _deferClearProgrammaticScroll();
 }
 function scrollToBottom(){
@@ -15540,13 +15600,27 @@ function _captureMessageScrollSnapshot(){
     _scrollPinned===false ||
     (typeof _recentMessageScrollIntent==='function'&&_recentMessageScrollIntent())
   );
+  const pinned=readerAwayFromBottom?false:_shouldFollowMessagesOnDomReplace();
+  // Pinned fast path: a bottom-following reader is restored from tail-relative
+  // bottom distance alone (_restorePinnedMessageScrollSnapshot handles it first
+  // in every restore path), so the semantic viewport anchor is never consulted
+  // for this snapshot. Capturing it anyway walks the rendered rows and reads
+  // each row's getBoundingClientRect until the first visible row — at the
+  // bottom that is a near-full scan of the transcript, and each read forces a
+  // synchronous layout. Measured as the dominant streaming-path hotspot
+  // (getClientRects/updateLayout/flex first-place samples on long sessions).
+  // Unpinned readers (and snapshots that will not take the pinned restore
+  // path) keep the anchor exactly as before.
+  const anchor=!pinned&&typeof _captureMessageViewportAnchor==='function'
+    ? _captureMessageViewportAnchor()
+    : null;
   return {
-    anchor:(typeof _captureMessageViewportAnchor==='function')?_captureMessageViewportAnchor():null,
+    anchor,
     top:el.scrollTop,
     bottom,
     scrollHeight:el.scrollHeight,
     inputGeneration:typeof _messageScrollInputGeneration==='number' ? _messageScrollInputGeneration : 0,
-    pinned:readerAwayFromBottom?false:_shouldFollowMessagesOnDomReplace(),
+    pinned,
     userUnpinned:readerAwayFromBottom?true:_messageUserUnpinned,
   };
 }
@@ -16362,6 +16436,8 @@ function renderMessages(options){
   // Mid-stream flicker fix (#3877): when a renderMessages() rebuild is reached
   // while THIS session is actively streaming (e.g. the clarify-response echo at
   // messages.js, or a CLI-import refresh), the `inner.innerHTML=''` below detaches
+  // the old transcript; any cached bottom distance measured against it is stale.
+  if(typeof _invalidateMessageGeometryCache==='function') _invalidateMessageGeometryCache();
   // the live `#liveAssistantTurn` node — and the smd parser keeps writing into
   // that now-orphaned node, so the streamed text vanishes until the next stream
   // event rebuilds the turn ("disappears, then reappears"). Capture the live

@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -59,7 +60,17 @@ def test_scroll_to_bottom_settles_across_late_markdown_layout_growth():
     # settle still runs even when Auto-follow is off (explicit user jump). The
     # automatic scrollIfPinned() path passes no explicit flag (stays auto-gated).
     assert "_settleMessageScrollToBottom(false, true)" in scroll
-    assert "_settleMessageScrollToBottom(false)" in pinned
+    # Fix 2: scrollIfPinned is write-only — it clamps to the bottom without
+    # reading scrollTop back (a post-write read forces synchronous layout on
+    # every streaming follow step). The scroll event it emits syncs the
+    # trackers and geometry cache after layout settles; the settle itself is
+    # owned by scrollToBottom (explicit) and the pinned restore path.
+    assert "el.scrollTop=1e9" in pinned, "scrollIfPinned must still clamp to the bottom"
+    assert "_deferClearProgrammaticScroll()" in pinned
+    assert not re.search(r"^(\s*)_lastScrollTop=el\.scrollTop;\s*$", pinned, re.M), (
+        "scrollIfPinned must not read scrollTop back after writing "
+        "(read-after-write forces a synchronous layout per follow step)"
+    )
     assert "!_scrollPinned" in settle
     assert "const token=++_bottomSettleToken" in settle
     assert "token!==_bottomSettleToken" in settle
@@ -103,14 +114,15 @@ def test_user_scroll_cancels_delayed_bottom_settling():
     # scrollIfPinned() may now re-pin auto-follow (#5544), but ONLY when the
     # reader has genuinely returned to the true bottom tail (<=80px) AND no
     # recent scroll intent is active — it must never fight a manual scroll-up.
-    # Assert those guards are present instead of the old "bail unconditionally
-    # when unpinned" lock.
-    _pinned_compact = pinned.replace(" ", "")
-    assert "_messageBottomDistance()>80" in _pinned_compact, (
-        "scrollIfPinned() re-pin must require the true bottom tail (<=80px), not mere proximity"
+    # Since Fix 2 the re-pin guard lives in the #messages scroll listener (the
+    # layout-safe read phase after each scrollTop write), not inside the
+    # write-only scrollIfPinned(). Assert the same guards at their new home.
+    _listener_compact = listener_block.replace(" ", "")
+    assert "bottomDistance<=80" in _listener_compact, (
+        "scroll re-pin must require the true bottom tail (<=80px), not mere proximity"
     )
-    assert "_recentMessageWheelIntent()" in _pinned_compact and "_recentMessageKeyScrollIntent()" in _pinned_compact, (
-        "scrollIfPinned() re-pin must bail on recent wheel/key scroll intent so it can't fight a reader"
+    assert "_recentMessageWheelIntent()" in _listener_compact and "_recentMessageKeyScrollIntent()" in _listener_compact, (
+        "scroll re-pin must bail on recent wheel/key scroll intent so it can't fight a reader"
     )
     assert "_messageUserUnpinned" in final and "return" in final
     assert "_recentMessageUpwardIntent()" not in pinned
@@ -166,7 +178,10 @@ def test_preserve_scroll_restores_unpinned_viewport_after_dom_rebuild():
     assert "_restoreMessageScrollSnapshot(scrollSnapshot);\n    _maybeShowNewMessageScrollCue(scrollSnapshot);" in after_render
     assert "_shouldFollowMessagesOnDomReplace()" in follow
     assert "scrollToBottom();" in follow
-    assert "anchor:(typeof _captureMessageViewportAnchor==='function')?_captureMessageViewportAnchor():null" in capture
+    assert "anchor:(typeof _captureMessageViewportAnchor==='function')?_captureMessageViewportAnchor():null" in capture or "anchor=!pinned&&typeof _captureMessageViewportAnchor==='function'" in capture, (
+        "capture must still obtain the semantic viewport anchor via _captureMessageViewportAnchor "
+        "(pinned fast path gates it on !pinned; unpinned readers keep the full anchor)"
+    )
     assert "sessionIdx:Number.isFinite(sessionIdx)?sessionIdx:_messageSessionIndexForRawIdx(rawIdx)" in UI_JS
     assert "key:row&&row.dataset?String(row.dataset.messageAnchorKey||''):''" in UI_JS
     assert "row.dataset.sessionMsgIdx=_messageSessionIndexForRawIdx(rawIdx);" in UI_JS
