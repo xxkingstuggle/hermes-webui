@@ -1,3 +1,56 @@
+function _inflightHasRenderableLiveState(inflight){
+  // Local mirror of sessions.js _inflightHasVisibleLiveState (that helper is
+  // not window-exposed): hydrate-then-tail must fire exactly when the local
+  // INFLIGHT carries no renderable live turn.
+  if(!inflight||typeof inflight!=='object') return false;
+  if(String(inflight.lastAssistantText||'').trim()) return true;
+  if(String(inflight.lastReasoningText||'').trim()) return true;
+  if(String(inflight.liveTurnHtml||'').trim()) return true;
+  if(Array.isArray(inflight.toolCalls)&&inflight.toolCalls.length) return true;
+  if(Array.isArray(inflight.activityBurstAnchors)&&inflight.activityBurstAnchors.length) return true;
+  if(Array.isArray(inflight.messages)){
+    return inflight.messages.some((msg)=>{
+      if(!msg) return false;
+      if(msg.role==='user') return Boolean(typeof msgContent==='function'?msgContent(msg):(msg.content||'').trim());
+      if(msg.role!=='assistant') return false;
+      const c=msg.content;
+      if(typeof c==='string') return c.trim();
+      if(Array.isArray(c)) return c.length>0;
+      return Boolean(c);
+    });
+  }
+  return false;
+}
+
+async function _hydrateActiveStreamFromSnapshot(streamId, activeSid){
+  // HYDRATE-THEN-TAIL body: fetch the server state-only fold of an ACTIVE
+  // stream's journal and write it into INFLIGHT. Returns the values the
+  // attach closure must seed (base text + resume cursor + scene), or null
+  // when hydration is unavailable — the caller then falls back to the legacy
+  // full-replay path.
+  try{
+    const rec=await api(`/api/chat/stream/recovery_snapshot?stream_id=${encodeURIComponent(streamId)}`);
+    const snap=rec&&rec.available&&rec.snapshot;
+    const toInflight=(typeof window._serverLiveSnapshotInflight==='function')&&snap
+      ? window._serverLiveSnapshotInflight(snap, [])
+      : null;
+    if(!toInflight) return null;
+    INFLIGHT[activeSid]=toInflight;
+    // Persisted so a mid-hydration reload resumes from the same cutoff
+    // instead of replaying from zero again.
+    if(typeof saveInflightState==='function') saveInflightState(activeSid, toInflight);
+    return {
+      assistantText:String(toInflight.lastAssistantText||''),
+      reasoningText:String(toInflight.lastReasoningText||''),
+      lastRunJournalSeq:Math.max(0,Number(toInflight.lastRunJournalSeq)||0),
+      lastRunJournalEventId:String(toInflight.lastRunJournalEventId||''),
+      scene:(toInflight.anchorActivityScene&&toInflight.anchorActivityScene.version==='activity_scene_v1')?toInflight.anchorActivityScene:null,
+    };
+  }catch(_){
+    return null;
+  }
+}
+
 function _markSessionViewed(sid, messageCount) {
   if(typeof _setSessionViewedCount!=='function' || !sid) return;
   const next = Number.isFinite(messageCount) ? Number(messageCount) : 0;
@@ -6760,9 +6813,13 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
               return;
             }
             if(st&&st.replay_available){
-              setComposerStatus('Restoring stream…');
-              _wireSSE(new EventSource(new URL(`api/chat/stream?stream_id=${encodeURIComponent(streamId)}${_runJournalReplayParams()}`,document.baseURI||location.href).href,{withCredentials:true}));
-              return;
+              // A terminal journal has nothing live left to replay; fall through
+              // to the settled-session restore below instead of flooding the DOM.
+              if(!(st.journal&&st.journal.terminal)){
+                setComposerStatus('Restoring stream…');
+                _wireSSE(new EventSource(new URL(`api/chat/stream?stream_id=${encodeURIComponent(streamId)}${_runJournalReplayParams()}`,document.baseURI||location.href).href,{withCredentials:true}));
+                return;
+              }
             }
           }catch(_){
             if(_deferStreamErrorIfOffline()) return;
@@ -7165,7 +7222,21 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     if(reconnecting){
       try{
         const st=await api(`/api/chat/stream/status?stream_id=${encodeURIComponent(streamId)}`);
-        if(!st.active&&st.replay_available){
+        if(st.active && !_inflightHasRenderableLiveState(INFLIGHT[activeSid])){
+          // HYDRATE-THEN-TAIL: no local live state for an ACTIVE stream —
+          // fetch the server state-only journal fold once and resume the live
+          // SSE from its exact cutoff (legacy full replay stays as fallback).
+          const _hy=await _hydrateActiveStreamFromSnapshot(streamId, activeSid);
+          if(_hy){
+            assistantText=_hy.assistantText;reasoningText=_hy.reasoningText;
+            liveReasoningText=_hy.reasoningText;segmentStart=0;
+            _freshSegment=!assistantText.length;_smdReconnect=true;
+            _lastRunJournalSeq=_hy.lastRunJournalSeq;
+            _lastRunJournalEventId=_hy.lastRunJournalEventId||'';
+            if(_hy.scene){try{_hydrateAnchorRegistryFromActivityScene(_hy.scene);}catch(_){ }}
+          }
+        }
+        if(!st.active&&st.replay_available&&!(st.journal&&st.journal.terminal)){
           replayOnly=true;
         }else if(!st.active){
           _clearOwnerInflightState();

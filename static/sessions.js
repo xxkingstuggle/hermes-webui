@@ -1098,6 +1098,7 @@ function _selectLiveRecoveryInflight(localInflight, serverLiveSnapshot, activeSt
   const serverSeq=Math.max(0,Number(serverLiveSnapshot.lastRunJournalSeq)||0);
   return serverSeq>=localSeq?selectDurableSnapshot():localInflight;
 }
+if(typeof window!=='undefined') window._serverLiveSnapshotInflight=_serverLiveSnapshotInflight;
 
 function _anchorActivitySceneStreamId(scene){
   if(!scene||typeof scene!=='object') return '';

@@ -13601,6 +13601,35 @@ def handle_get(handler, parsed) -> bool:
 
         return j(handler, cached_update_status(include_agent=include_agent_updates))
 
+    if parsed.path == "/api/chat/stream/recovery_snapshot":
+        # Hydrate-then-tail recovery: one-shot state-only fold of the journal
+        # for an ACTIVE stream. The fold is the same _run_journal_live_snapshot
+        # used for /api/session cold hydration — no live handlers, no SSE, no
+        # rendering; it returns the logical state plus the exact seq cutoff it
+        # covered (snapshot.last_seq), which the client then uses as the tail
+        # cursor for its live attach. This endpoint is only fetched when a
+        # client needs to reconstruct an active live turn it has no local
+        # state for (session switch-back, page refresh); it is intentionally
+        # NOT wired into metadata/status polls, which must stay cheap on
+        # multi-megabyte journals.
+        stream_id = parse_qs(parsed.query).get("stream_id", [""])[0]
+        if not _stream_id_visible_to_request_profile(handler, stream_id):
+            return True
+        active = stream_id in STREAMS
+        try:
+            snapshot = _run_journal_live_snapshot(stream_id, handler=handler) if stream_id else None
+        except Exception:
+            logger.debug("Recovery snapshot fold failed for stream %s", stream_id, exc_info=True)
+            snapshot = None
+        if not snapshot:
+            return j(handler, {"available": False, "active": active, "stream_id": stream_id})
+        return j(handler, {
+            "available": True,
+            "active": active,
+            "stream_id": stream_id,
+            "snapshot": _runtime_journal_snapshot_for_session_payload(snapshot),
+        })
+
     if parsed.path == "/api/chat/stream/status":
         stream_id = parse_qs(parsed.query).get("stream_id", [""])[0]
         if not _stream_id_visible_to_request_profile(handler, stream_id):
