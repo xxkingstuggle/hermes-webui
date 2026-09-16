@@ -2101,8 +2101,12 @@ def _format_nous_label(mid: str) -> str:
 # without one vendor dominating.
 _NOUS_FEATURED_THRESHOLD = 25
 _NOUS_FEATURED_TARGET = 15
-_MODEL_PICKER_OVERFLOW_THRESHOLD = _NOUS_FEATURED_THRESHOLD
-_MODEL_PICKER_VISIBLE_TARGET = _NOUS_FEATURED_TARGET
+# Custom-edit (2026-08-28): disable picker overflow folding — every model in
+# the catalog is shown in the dropdown; extra_models stays empty. The Nous
+# featured-set thresholds above still apply to the Nous Portal recommended
+# set only.
+_MODEL_PICKER_OVERFLOW_THRESHOLD = 1_000_000_000
+_MODEL_PICKER_VISIBLE_TARGET = 1_000_000_000
 _OPENROUTER_FREE_TIER_AUGMENT_CAP = 30
 
 # Vendor-prefix priority order for featured selection. Lower index = picked
