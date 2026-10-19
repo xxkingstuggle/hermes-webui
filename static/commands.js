@@ -2014,7 +2014,7 @@ let _skillCommandCacheReady=false;
 function _skillCommandSlug(name){
   const raw=String(name||'').trim().toLowerCase();
   if(!raw)return'';
-  return raw.replace(/[\s_]+/g,'-').replace(/[^a-z0-9-]/g,'').replace(/-{2,}/g,'-').replace(/^-+|-+$/g,'');
+  return raw.replace(/[\s_]+/g,'-').replace(/[^\p{L}\p{N}-]/gu,'').replace(/-{2,}/g,'-').replace(/^-+|-+$/g,'');
 }
 function _getReservedSlashCommandSlugs(){
   const reserved=new Set(COMMANDS.map(c=>String(c&&c.name||'').trim().toLowerCase()).filter(Boolean));

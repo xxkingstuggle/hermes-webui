@@ -302,7 +302,7 @@ If an AI assistant is helping with install, reinstall, bootstrap, provider setup
 ### Panels
 - **Chat** -- session list, search, pin, archive, projects, new conversation
 - **Tasks** -- view, create, edit, run, pause/resume, delete cron jobs; run history; completion alerts
-- **Skills** -- list all skills by category, search, preview, create/edit/delete; linked files viewer
+- **Skills** -- list all skills by category, search, preview, create/edit/delete; linked files viewer. Type `/` to find skill shortcuts, including Chinese and mixed-language names; select a skill and add your request, or use `/use <skill-name>` for the next message.
 - **Memory** -- view and edit MEMORY.md and USER.md inline
 - **Profiles** -- create, switch, delete agent profiles; clone config
 - **Todos** -- live task list from the current session
